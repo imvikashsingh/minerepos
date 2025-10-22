@@ -1,0 +1,46 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import rand, when, col
+from pyspark.sql.types import IntegerType, DoubleType
+
+def generate_data():
+    # Initialize Spark Session
+    spark = SparkSession.builder.appName("udf").getOrCreate()
+
+    # Generate Huge Synthetic Data (1,000,000 rows)
+    num_rows = 1000000
+    df = spark.range(num_rows).select(
+        (rand() * 52 + 18).cast(IntegerType()).alias("age"),
+        (rand() * 180000 + 20000).cast(DoubleType()).alias("income"),
+        (rand() * 45000 + 5000).cast(DoubleType()).alias("loan_amount"),
+        (rand() * 550 + 300).cast(IntegerType()).alias("credit_score")
+    )
+
+    # Simulate default target
+    df = df.withColumn("loan_income_ratio", col("loan_amount") / col("income"))
+    df = df.withColumn("default", when(
+        (col("credit_score") < 600) | (col("loan_income_ratio") > 0.5),
+        when(rand() > 0.3, 1).otherwise(0)
+    ).otherwise(
+        when(rand() > 0.9, 1).otherwise(0)
+    ).cast(IntegerType()))
+
+    # Drop temporary column
+    df = df.drop("loan_income_ratio")
+
+    # Data Preparation in PySpark
+    # Example prep: Add a new feature (credit_score_to_income ratio)
+    df = df.withColumn("credit_income_ratio", col("credit_score") / col("income"))
+
+    # Split into train and test (70/30)
+    train_df, test_df = df.randomSplit([0.7, 0.3], seed=42)
+
+    # Save as Parquet files (coalesced to single file for simplicity in Pandas)
+    train_df.coalesce(1).write.parquet("train_data.parquet", mode="overwrite")
+    test_df.coalesce(1).write.parquet("test_data.parquet", mode="overwrite")
+
+    # Stop Spark Session
+    spark.stop()
+
+
+if __name__=="__main__":
+    generate_data()
