@@ -1,0 +1,220 @@
+import pandas as pd
+import numpy as np
+from pyspark.sql import SparkSession
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix
+import pickle
+import os
+
+
+def prepare_training_features(df):
+    """
+    Prepare features for model training
+
+    Args:
+        df: Pandas DataFrame with raw features
+
+    Returns:
+        X: Feature matrix
+        y: Target variable
+    """
+    # Create additional derived features
+    df = df.copy()
+
+    # Encode categorical variables
+    df['home_ownership_encoded'] = df['home_ownership'].map({
+        'MORTGAGE': 0, 'RENT': 1, 'OWN': 2
+    }).fillna(1)
+
+    df['loan_purpose_encoded'] = df['loan_purpose'].map({
+        'debt_consolidation': 0, 'credit_card': 1, 'home_improvement': 2,
+        'major_purchase': 3, 'car': 4, 'other': 5
+    }).fillna(5)
+
+    # Select features
+    feature_cols = [
+        'age', 'annual_income', 'credit_score', 'employment_length',
+        'loan_amount', 'interest_rate', 'loan_term',
+        'monthly_debt', 'credit_card_balance', 'credit_limit',
+        'num_credit_inquiries', 'delinquencies_2yrs', 'num_open_accounts',
+        'bankruptcies', 'debt_to_income', 'loan_to_income', 'credit_utilization',
+        'home_ownership_encoded', 'loan_purpose_encoded'
+    ]
+
+    X = df[feature_cols].fillna(0)
+    y = df['default_flag']
+
+    return X, y
+
+
+def train_loan_default_model(spark, data_path="./bank_data",
+                             model_path="./model",
+                             batch_size=500_000,
+                             sample_fraction=0.1):
+    """
+    Train loan default prediction model using batched processing
+
+    Args:
+        spark: SparkSession
+        data_path: Path to training data
+        model_path: Path to save trained model
+        batch_size: Number of records per batch
+        sample_fraction: Fraction of data to use for training (for speed)
+    """
+    print("=" * 80)
+    print("MODEL TRAINING PIPELINE")
+    print("=" * 80)
+
+    # Load data
+    print(f"\n1. Loading data from {data_path}...")
+    df = spark.read.parquet(data_path)
+
+    # Sample for faster training (remove this for production)
+    if sample_fraction < 1.0:
+        print(f"   Sampling {sample_fraction * 100}% of data for training...")
+        df = df.sample(fraction=sample_fraction, seed=42)
+
+    total_rows = df.count()
+    print(f"   ✓ Loaded {total_rows:,} records")
+
+    # Split train/test
+    print("\n2. Splitting data into train/test sets...")
+    train_df, test_df = df.randomSplit([0.8, 0.2], seed=42)
+    train_count = train_df.count()
+    test_count = test_df.count()
+    print(f"   ✓ Training set: {train_count:,} records")
+    print(f"   ✓ Test set: {test_count:,} records")
+
+    # Process training data in batches
+    print(f"\n3. Processing training data in batches of {batch_size:,}...")
+    num_batches = (train_count // batch_size) + 1
+
+    all_X_batches = []
+    all_y_batches = []
+
+    for i in range(num_batches):
+        offset = i * batch_size
+        batch_df = train_df.limit(batch_size).toPandas() if i == 0 else \
+            train_df.limit(batch_size + offset).subtract(
+                train_df.limit(offset)
+            ).toPandas()
+
+        # Alternative approach: use skip
+        batch_spark = train_df.offset(offset).limit(batch_size)
+        batch_df = batch_spark.toPandas()
+
+        if len(batch_df) == 0:
+            break
+
+        print(f"   Processing batch {i + 1}/{num_batches} ({len(batch_df):,} records)...")
+
+        # Prepare features
+        X_batch, y_batch = prepare_training_features(batch_df)
+        all_X_batches.append(X_batch)
+        all_y_batches.append(y_batch)
+
+    # Combine all batches
+    print("\n4. Combining batches and training model...")
+    X_train = pd.concat(all_X_batches, ignore_index=True)
+    y_train = pd.concat(all_y_batches, ignore_index=True)
+
+    print(f"   ✓ Total training samples: {len(X_train):,}")
+    print(f"   ✓ Feature dimensions: {X_train.shape}")
+    print(f"   ✓ Default rate: {y_train.mean() * 100:.2f}%")
+
+    # Scale features
+    print("\n5. Scaling features...")
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+
+    # Train model
+    print("\n6. Training Random Forest model...")
+    model = RandomForestClassifier(
+        n_estimators=100,
+        max_depth=10,
+        min_samples_split=100,
+        min_samples_leaf=50,
+        random_state=42,
+        n_jobs=-1,
+        verbose=1
+    )
+    model.fit(X_train_scaled, y_train)
+    print("   ✓ Model training complete!")
+
+    # Evaluate on test set
+    print("\n7. Evaluating model on test set...")
+    test_pdf = test_df.toPandas()
+    X_test, y_test = prepare_training_features(test_pdf)
+    X_test_scaled = scaler.transform(X_test)
+
+    y_pred = model.predict(X_test_scaled)
+    y_pred_proba = model.predict_proba(X_test_scaled)[:, 1]
+
+    print("\n" + "=" * 80)
+    print("MODEL EVALUATION RESULTS")
+    print("=" * 80)
+    print("\nClassification Report:")
+    print(classification_report(y_test, y_pred, target_names=['No Default', 'Default']))
+
+    print(f"\nROC-AUC Score: {roc_auc_score(y_test, y_pred_proba):.4f}")
+
+    print("\nConfusion Matrix:")
+    cm = confusion_matrix(y_test, y_pred)
+    print(f"                Predicted No Default  Predicted Default")
+    print(f"Actual No Default:      {cm[0][0]:,}              {cm[0][1]:,}")
+    print(f"Actual Default:         {cm[1][0]:,}              {cm[1][1]:,}")
+
+    # Feature importance
+    print("\nTop 10 Most Important Features:")
+    feature_names = X_train.columns
+    feature_importance = pd.DataFrame({
+        'feature': feature_names,
+        'importance': model.feature_importances_
+    }).sort_values('importance', ascending=False)
+    print(feature_importance.head(10).to_string(index=False))
+
+    # Save model and scaler
+    print(f"\n8. Saving model to {model_path}...")
+    os.makedirs(model_path, exist_ok=True)
+
+    with open(f"{model_path}/model.pkl", "wb") as f:
+        pickle.dump(model, f)
+
+    with open(f"{model_path}/scaler.pkl", "wb") as f:
+        pickle.dump(scaler, f)
+
+    with open(f"{model_path}/feature_names.pkl", "wb") as f:
+        pickle.dump(list(feature_names), f)
+
+    print("   ✓ Model saved successfully!")
+    print("\n" + "=" * 80)
+
+    return model, scaler, list(feature_names)
+
+
+
+def start_model_train():
+    model_path = "./trained_model"
+    data_path = "./bank_loan_data"
+
+    # Initialize Spark
+    spark = SparkSession.builder \
+        .appName("udf") \
+        .config("spark.sql.shuffle.partitions", "200") \
+        .config("spark.sql.execution.arrow.pyspark.enabled", "true") \
+        .config("spark.driver.memory", "4g") \
+        .config("spark.executor.memory", "4g") \
+        .getOrCreate()
+
+    model, scaler, feature_names = train_loan_default_model(
+        spark,
+        data_path=data_path,
+        model_path=model_path,
+        batch_size=200_000,
+        sample_fraction=0.2  # Use 20% for faster demo
+    )
+
+
+if __name__=="__main__":
+    start_model_train()
