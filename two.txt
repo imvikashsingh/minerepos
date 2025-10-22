@@ -1,0 +1,38 @@
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+import joblib
+
+from pyspark.sql import SparkSession
+
+def train_model():
+    spark = SparkSession.builder.appName("BankLoanDefaultTraining").getOrCreate()
+
+    # Read training data from Parquet
+    train_df = spark.read.parquet("train_data.parquet")
+    train_pd = train_df.toPandas()  # Convert to Pandas for scikit-learn
+
+    # Stop Spark Session
+    spark.stop()
+
+    # Separate features and target
+    feature_columns = ["age", "income", "loan_amount", "credit_score", "credit_income_ratio"]
+    X_train = train_pd[feature_columns]
+    y_train = train_pd["default"]
+
+    # Define scikit-learn Pipeline
+    pipeline = Pipeline([
+        ("scaler", StandardScaler()),  # Scale features
+        ("classifier", LogisticRegression(random_state=42))  # Logistic Regression
+    ])
+
+    # Train the model
+    pipeline.fit(X_train, y_train)
+
+    # Save the trained model
+    joblib.dump(pipeline, "loan_model.joblib")
+
+
+if __name__=="__main__":
+    train_model()
