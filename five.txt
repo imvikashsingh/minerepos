@@ -1,0 +1,349 @@
+from pyspark.sql import SparkSession
+import pandas as pd
+import pickle
+import time
+from datetime import timedelta
+
+from orange.model_scoring import prepare_scoring_features
+
+
+def score_with_collect_all(spark, data_path="./bank_loan_data",
+                           model_path="./trained_model",
+                           output_path="./predictions_collected"):
+    """
+    Score by collecting ALL data to driver node
+
+    ⚠️ WARNING: This is the WORST approach!
+    - Collects entire dataset to single driver node
+    - Uses only driver memory (not distributed)
+    - Will cause OOM errors with large datasets
+    - Single-threaded processing
+    """
+    print("=" * 80)
+    print("APPROACH 1: COLLECT ALL DATA TO DRIVER (Non-Distributed)")
+    print("=" * 80)
+    print("⚠️  WARNING: This approach is NOT distributed and will cause OOM!")
+    print()
+
+    start_time = time.time()
+
+    # Load model
+    print("1. Loading model...")
+    with open(f"{model_path}/model.pkl", "rb") as f:
+        model = pickle.load(f)
+    with open(f"{model_path}/scaler.pkl", "rb") as f:
+        scaler = pickle.load(f)
+
+    # Load data
+    print("2. Loading Spark DataFrame...")
+    df = spark.read.parquet(data_path)
+    total_rows = df.count()
+    print(f"   Total records: {total_rows:,}")
+
+    # ⚠️ THE PROBLEM: Collect all data to driver
+    print("\n3. Collecting ALL data to driver node...")
+    print("   ⚠️  All data moved to single node (driver)")
+    print("   ⚠️  Cluster nodes sitting idle")
+    collect_start = time.time()
+
+    pdf = df.toPandas()  # ⚠️ THIS IS THE BOTTLENECK!
+
+    collect_time = time.time() - collect_start
+    print(f"   ✓ Data collected in {collect_time:.2f} seconds")
+    print(f"   Memory usage: ~{pdf.memory_usage(deep=True).sum() / 1024 ** 2:.2f} MB")
+
+    # Prepare features
+    print("\n4. Preparing features on driver...")
+
+    X = prepare_scoring_features(pdf)
+
+    # Score on driver
+    print("\n5. Scoring on driver (single-threaded)...")
+    score_start = time.time()
+
+    X_scaled = scaler.transform(X)
+    predictions = model.predict_proba(X_scaled)[:, 1]
+
+    score_time = time.time() - score_start
+    print(f"   ✓ Scored {total_rows:,} records in {score_time:.2f} seconds")
+
+    # Add predictions back to DataFrame
+    pdf['default_probability'] = predictions
+    pdf['risk_category'] = pd.cut(
+        predictions,
+        bins=[0, 0.3, 0.7, 1.0],
+        labels=['LOW', 'MEDIUM', 'HIGH']
+    )
+
+    # Convert back to Spark (another bottleneck!)
+    print("\n6. Converting back to Spark DataFrame...")
+    convert_start = time.time()
+    result_df = spark.createDataFrame(pdf)
+    convert_time = time.time() - convert_start
+    print(f"   ✓ Converted in {convert_time:.2f} seconds")
+
+    # Save
+    print(f"\n7. Saving to {output_path}...")
+    result_df.write.mode("overwrite").parquet(output_path)
+
+    total_time = time.time() - start_time
+
+    print("\n" + "-" * 80)
+    print("TIMING BREAKDOWN:")
+    print("-" * 80)
+    print(f"Collect data to driver: {collect_time:>8.2f} seconds")
+    print(f"Scoring on driver:      {score_time:>8.2f} seconds")
+    print(f"Convert back to Spark:  {convert_time:>8.2f} seconds")
+    print(f"Total time:             {total_time:>8.2f} seconds")
+    print("-" * 80)
+    print()
+
+    return result_df, total_time
+
+
+def score_with_batches(spark, data_path="./bank_loan_data",
+                       model_path="./trained_model",
+                       output_path="./predictions_batched",
+                       batch_size=100_000):
+    """
+    Score by processing data in batches
+
+    ⚠️ Still runs on driver node only
+    - Better than collecting all, but still single-node
+    - Sequential batch processing (not parallel)
+    - Limited by driver memory
+    - Does not use cluster resources efficiently
+    """
+    print("=" * 80)
+    print("APPROACH 2: BATCH PROCESSING (Still Non-Distributed)")
+    print("=" * 80)
+    print("⚠️  WARNING: Still processes on driver only (not distributed)")
+    print()
+
+    start_time = time.time()
+
+    # Load model
+    print("1. Loading model...")
+    with open(f"{model_path}/model.pkl", "rb") as f:
+        model = pickle.load(f)
+    with open(f"{model_path}/scaler.pkl", "rb") as f:
+        scaler = pickle.load(f)
+
+    # Load data
+    print("2. Loading Spark DataFrame...")
+    df = spark.read.parquet(data_path)
+    total_rows = df.count()
+    print(f"   Total records: {total_rows:,}")
+
+    num_batches = (total_rows // batch_size) + 1
+    print(f"\n3. Processing in {num_batches} batches of {batch_size:,} records")
+    print("   ⚠️  Each batch processed sequentially on driver")
+
+    all_results = []
+    total_score_time = 0
+
+
+    for i in range(num_batches):
+        batch_start = time.time()
+
+        # Get batch (still collects to driver)
+        offset = i * batch_size
+        batch_df = df.offset(offset).limit(batch_size).toPandas()
+
+        if len(batch_df) == 0:
+            break
+
+        print(f"\n   Batch {i + 1}/{num_batches}: {len(batch_df):,} records")
+
+        # Prepare features
+        X = prepare_scoring_features(batch_df)
+
+        # Score
+        X_scaled = scaler.transform(X)
+        predictions = model.predict_proba(X_scaled)[:, 1]
+
+        batch_df['default_probability'] = predictions
+        batch_df['risk_category'] = pd.cut(
+            predictions,
+            bins=[0, 0.3, 0.7, 1.0],
+            labels=['LOW', 'MEDIUM', 'HIGH']
+        )
+
+        all_results.append(batch_df)
+
+        batch_time = time.time() - batch_start
+        total_score_time += batch_time
+        print(f"      Processed in {batch_time:.2f} seconds")
+
+    # Combine results
+    print("\n4. Combining all batches...")
+    combine_start = time.time()
+    result_pdf = pd.concat(all_results, ignore_index=True)
+    result_df = spark.createDataFrame(result_pdf)
+    combine_time = time.time() - combine_start
+    print(f"   ✓ Combined in {combine_time:.2f} seconds")
+
+    # Save
+    print(f"\n5. Saving to {output_path}...")
+    result_df.write.mode("overwrite").parquet(output_path)
+
+    total_time = time.time() - start_time
+
+    print("\n" + "-" * 80)
+    print("TIMING BREAKDOWN:")
+    print("-" * 80)
+    print(f"Total scoring time:     {total_score_time:>8.2f} seconds")
+    print(f"Combining batches:      {combine_time:>8.2f} seconds")
+    print(f"Total time:             {total_time:>8.2f} seconds")
+    print("-" * 80)
+    print()
+
+    return result_df, total_time
+
+
+def score_original_problem(spark, data_path="./bank_loan_data",
+                           model_path="./trained_model",
+                           sample_fraction=0.1):
+    """
+    This simulates your ORIGINAL problem:
+    1. Load data from PySpark
+    2. Convert to Pandas (toPandas)
+    3. Score with sklearn
+
+    This is what causes OOM errors!
+    """
+    print("=" * 80)
+    print("APPROACH 4: ORIGINAL PROBLEM (Your Current Approach)")
+    print("=" * 80)
+    print("⚠️  THIS IS YOUR ORIGINAL PROBLEM - CAUSES OOM!")
+    print()
+
+    start_time = time.time()
+
+    print("1. Loading data from PySpark...")
+    df = spark.read.parquet(data_path)
+    total_rows = df.count()
+    print(f"   Total records: {total_rows:,}")
+
+    if sample_fraction < 1.0:
+        print(f"\n   ⚠️  Sampling {sample_fraction * 100}% to avoid OOM in demo")
+        df = df.sample(fraction=sample_fraction, seed=42)
+        sampled_rows = df.count()
+        print(f"   Sampled records: {sampled_rows:,}")
+
+    # Load model
+    print("\n2. Loading model on driver...")
+    with open(f"{model_path}/model.pkl", "rb") as f:
+        model = pickle.load(f)
+    with open(f"{model_path}/scaler.pkl", "rb") as f:
+        scaler = pickle.load(f)
+
+    # THE PROBLEM: Convert entire dataset to Pandas
+    print("\n3. Converting to Pandas (toPandas)...")
+    print("   ⚠️  THIS IS WHERE OOM HAPPENS WITH LARGE DATA!")
+    convert_start = time.time()
+
+    pdf = df.toPandas()  # ⚠️ ALL DATA TO SINGLE NODE!
+
+    convert_time = time.time() - convert_start
+    print(f"   ✓ Converted in {convert_time:.2f} seconds")
+    print(f"   Memory: ~{pdf.memory_usage(deep=True).sum() / 1024 ** 2:.2f} MB")
+
+    # Data preparation with Pandas
+    print("\n4. Preparing features with Pandas...")
+    from part3_model_scoring import prepare_scoring_features
+    X = prepare_scoring_features(pdf)
+
+    # Model scoring
+    print("\n5. Scoring with sklearn on single node...")
+    score_start = time.time()
+
+    X_scaled = scaler.transform(X)
+    predictions = model.predict_proba(X_scaled)[:, 1]
+
+    score_time = time.time() - score_start
+    print(f"   ✓ Scored in {score_time:.2f} seconds")
+
+    total_time = time.time() - start_time
+
+    print("\n" + "-" * 80)
+    print("TIMING BREAKDOWN:")
+    print("-" * 80)
+    print(f"Convert to Pandas:      {convert_time:>8.2f} seconds")
+    print(f"Scoring:                {score_time:>8.2f} seconds")
+    print(f"Total time:             {total_time:>8.2f} seconds")
+    print("-" * 80)
+    print("\n💡 PROBLEM: With 10M+ rows, toPandas() will cause OOM!")
+    print("💡 SOLUTION: Use pandas_udf to distribute scoring")
+    print()
+
+    return total_time
+
+
+def compare_all_approaches(spark, data_path="./bank_loan_data",
+                           model_path="./trained_model",
+                           run_slow_methods=False):
+    """
+    Compare all scoring approaches
+
+    Args:
+        run_slow_methods: If False, only runs safe approaches to avoid OOM
+    """
+    print("\n")
+    print("█" * 80)
+    print("█" + " " * 20 + "SCORING APPROACH COMPARISON" + " " * 32 + "█")
+    print("█" * 80)
+    print("\n")
+
+    results = {}
+
+    # Original problem (sampled)
+    print("\n" + "▶" * 40)
+    results['Original Problem'] = score_original_problem(
+        spark, data_path, model_path, sample_fraction=0.1
+    )
+
+    if run_slow_methods:
+        # Approach 1: Collect all (dangerous!)
+        print("\n" + "▶" * 40)
+        _, results['Collect All'] = score_with_collect_all(
+            spark, data_path, model_path
+        )
+
+        # Approach 2: Batches
+        print("\n" + "▶" * 40)
+        _, results['Batched'] = score_with_batches(
+            spark, data_path, model_path, batch_size=100_000
+        )
+
+    else:
+        print("\n⚠️  Skipping slow/dangerous methods to avoid OOM")
+        print("   Set run_slow_methods=True to run all comparisons\n")
+
+    # Print comparison
+    print("\n")
+    print("█" * 80)
+    print("█" + " " * 28 + "TIMING COMPARISON" + " " * 34 + "█")
+    print("█" * 80)
+    print()
+    print("-" * 80)
+    print(f"{'Approach':<30} {'Time (seconds)':>20} {'Status':>25}")
+    print("-" * 80)
+
+    for approach, timing in results.items():
+        status = "⚠️  OOM Risk" if approach in ['Collect All', 'Original Problem'] else "✓ Safe"
+        print(f"{approach:<30} {timing:>20.2f} {status:>25}")
+
+    print("-" * 80)
+    print("\n📊 RECOMMENDATION: Use pandas_udf (from previous code)")
+    print("   - Fully distributed across cluster")
+    print("   - No OOM errors")
+    print("   - Fastest for large datasets")
+    print("   - Scales linearly with cluster size\n")
+
+def start_model_scoring_normal():
+    pass
+
+
+if __name__=="__main__":
+    start_model_scoring_normal()
