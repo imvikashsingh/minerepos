@@ -1,0 +1,225 @@
+import pickle
+
+import pandas as pd
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import pandas_udf, PandasUDFType
+from pyspark.sql.types import DoubleType, StringType
+
+from pyspark.sql.functions import (
+    rand, randn, when, col, expr, monotonically_increasing_id,
+    round as spark_round, floor, lit
+)
+from pyspark.sql.types import *
+
+
+def prepare_scoring_features(df):
+    """
+    Prepare features for scoring (same logic as training)
+
+    Args:
+        df: Pandas DataFrame with raw features
+
+    Returns:
+        X: Feature matrix
+    """
+    df = df.copy()
+
+    # Encode categorical variables
+    df['home_ownership_encoded'] = df['home_ownership'].map({
+        'MORTGAGE': 0, 'RENT': 1, 'OWN': 2
+    }).fillna(1)
+
+    df['loan_purpose_encoded'] = df['loan_purpose'].map({
+        'debt_consolidation': 0, 'credit_card': 1, 'home_improvement': 2,
+        'major_purchase': 3, 'car': 4, 'other': 5
+    }).fillna(5)
+
+    # Select features (must match training)
+    feature_cols = [
+        'age', 'annual_income', 'credit_score', 'employment_length',
+        'loan_amount', 'interest_rate', 'loan_term',
+        'monthly_debt', 'credit_card_balance', 'credit_limit',
+        'num_credit_inquiries', 'delinquencies_2yrs', 'num_open_accounts',
+        'bankruptcies', 'debt_to_income', 'loan_to_income', 'credit_utilization',
+        'home_ownership_encoded', 'loan_purpose_encoded'
+    ]
+
+    X = df[feature_cols].fillna(0)
+
+    return X
+
+
+def score_loan_applications(spark, data_path="./bank_data",
+                            model_path="./model",
+                            output_path="./predictions"):
+    """
+    Score loan applications using distributed pandas UDF
+
+    Args:
+        spark: SparkSession
+        data_path: Path to data for scoring
+        model_path: Path to trained model
+        output_path: Path to save predictions
+    """
+    print("=" * 80)
+    print("MODEL SCORING PIPELINE")
+    print("=" * 80)
+
+    # Load data
+    print(f"\n1. Loading data from {data_path}...")
+    df = spark.read.parquet(data_path)
+    total_rows = df.count()
+    print(f"   ✓ Loaded {total_rows:,} records for scoring")
+
+    # Load model, scaler, and feature names
+    print(f"\n2. Loading trained model from {model_path}...")
+    with open(f"{model_path}/model.pkl", "rb") as f:
+        model = pickle.load(f)
+
+    with open(f"{model_path}/scaler.pkl", "rb") as f:
+        scaler = pickle.load(f)
+
+    with open(f"{model_path}/feature_names.pkl", "rb") as f:
+        feature_names = pickle.load(f)
+
+    print(f"   ✓ Model loaded successfully")
+    print(f"   ✓ Model type: {type(model).__name__}")
+    print(f"   ✓ Features: {len(feature_names)}")
+
+    # Broadcast model and scaler to all executors
+    print("\n3. Broadcasting model to all cluster nodes...")
+    model_broadcast = spark.sparkContext.broadcast(pickle.dumps(model))
+    scaler_broadcast = spark.sparkContext.broadcast(pickle.dumps(scaler))
+    feature_names_broadcast = spark.sparkContext.broadcast(feature_names)
+    print("   ✓ Model broadcasted")
+
+    # Define pandas UDF for prediction
+    @pandas_udf(DoubleType())
+    def predict_default_probability(
+            age, annual_income, credit_score, employment_length,
+            loan_amount, interest_rate, loan_term,
+            monthly_debt, credit_card_balance, credit_limit,
+            num_credit_inquiries, delinquencies_2yrs, num_open_accounts,
+            bankruptcies, debt_to_income, loan_to_income, credit_utilization,
+            home_ownership, loan_purpose
+    ):
+        """
+        Predict default probability for a batch of loans
+        This function runs in parallel on each executor
+        """
+        # Deserialize model and scaler (once per batch)
+        model_loaded = pickle.loads(model_broadcast.value)
+        scaler_loaded = pickle.loads(scaler_broadcast.value)
+
+        # Create DataFrame from input columns
+        df = pd.DataFrame({
+            'age': age,
+            'annual_income': annual_income,
+            'credit_score': credit_score,
+            'employment_length': employment_length,
+            'loan_amount': loan_amount,
+            'interest_rate': interest_rate,
+            'loan_term': loan_term,
+            'monthly_debt': monthly_debt,
+            'credit_card_balance': credit_card_balance,
+            'credit_limit': credit_limit,
+            'num_credit_inquiries': num_credit_inquiries,
+            'delinquencies_2yrs': delinquencies_2yrs,
+            'num_open_accounts': num_open_accounts,
+            'bankruptcies': bankruptcies,
+            'debt_to_income': debt_to_income,
+            'loan_to_income': loan_to_income,
+            'credit_utilization': credit_utilization,
+            'home_ownership': home_ownership,
+            'loan_purpose': loan_purpose
+        })
+
+        # Prepare features (same as training)
+        X = prepare_scoring_features(df)
+
+        # Scale and predict
+        X_scaled = scaler_loaded.transform(X)
+        predictions = model_loaded.predict_proba(X_scaled)[:, 1]
+
+        return pd.Series(predictions)
+
+    # Apply UDF to score all records
+    print("\n4. Scoring all records (distributed across cluster)...")
+    scored_df = df.withColumn(
+        "default_probability",
+        predict_default_probability(
+            col("age"), col("annual_income"), col("credit_score"),
+            col("employment_length"), col("loan_amount"), col("interest_rate"),
+            col("loan_term"), col("monthly_debt"), col("credit_card_balance"),
+            col("credit_limit"), col("num_credit_inquiries"),
+            col("delinquencies_2yrs"), col("num_open_accounts"),
+            col("bankruptcies"), col("debt_to_income"), col("loan_to_income"),
+            col("credit_utilization"), col("home_ownership"), col("loan_purpose")
+        )
+    )
+
+    # Add risk category
+    scored_df = scored_df.withColumn(
+        "risk_category",
+        when(col("default_probability") < 0.3, "LOW")
+        .when(col("default_probability") < 0.7, "MEDIUM")
+        .otherwise("HIGH")
+    )
+
+    # Add approval recommendation
+    scored_df = scored_df.withColumn(
+        "approval_recommendation",
+        when((col("default_probability") < 0.4) & (col("credit_score") > 650), "APPROVE")
+        .when(col("default_probability") < 0.6, "MANUAL_REVIEW")
+        .otherwise("REJECT")
+    )
+
+    print("   ✓ Scoring complete!")
+
+    # Show sample results
+    print("\n5. Sample Predictions:")
+    scored_df.select(
+        "customer_id", "credit_score", "loan_amount", "annual_income",
+        "default_probability", "risk_category", "approval_recommendation"
+    ).show(10, truncate=False)
+
+    # Statistics
+    print("\n6. Prediction Statistics:")
+    scored_df.groupBy("risk_category").count().orderBy("risk_category").show()
+    scored_df.groupBy("approval_recommendation").count().orderBy("approval_recommendation").show()
+
+    # Save predictions
+    print(f"\n7. Saving predictions to {output_path}...")
+    scored_df.write.mode("overwrite").parquet(output_path)
+    print("   ✓ Predictions saved successfully!")
+
+    print("\n" + "=" * 80)
+    print(f"✓ Successfully scored {total_rows:,} loan applications")
+    print(f"✓ Results saved to: {output_path}")
+    print("=" * 80)
+
+    return scored_df
+
+
+def start_model_scoring():
+    output_path = "./loan_predictions"
+    model_path = "./trained_model"
+    data_path = "./bank_loan_data"
+    # Initialize Spark
+    spark = SparkSession.builder \
+        .appName("udf") \
+        .config("spark.sql.shuffle.partitions", "200") \
+        .config("spark.sql.execution.arrow.pyspark.enabled", "true") \
+        .config("spark.driver.memory", "4g") \
+        .config("spark.executor.memory", "4g") \
+        .getOrCreate()
+    predictions = score_loan_applications(
+        spark,
+        data_path=data_path,
+        model_path=model_path,
+        output_path=output_path
+    )
+
+
+if __name__=="__main__":
+    start_model_scoring()
