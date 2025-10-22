@@ -1,0 +1,52 @@
+import pandas as pd
+from sklearn.metrics import accuracy_score, classification_report
+import joblib
+from pyspark.sql import SparkSession
+import time
+import sys
+import gc
+
+
+def model_prediction():
+    start_time = time.time()
+    # Initialize Spark Session for reading Parquet
+    spark = SparkSession.builder.appName("BankLoanDefaultPrediction").getOrCreate()
+
+    print(f"Number of partitions in test_df: {spark.read.parquet('test_data.parquet').rdd.getNumPartitions()}")
+    try:
+        # Read test data from Parquet
+        test_df = spark.read.parquet("test_data.parquet")
+        test_pd = test_df.toPandas()  # Convert to Pandas for scikit-learn
+
+        # Stop Spark Session
+        spark.stop()
+
+        # Separate features and target
+        feature_columns = ["age", "income", "loan_amount", "credit_score", "credit_income_ratio"]
+        X_test = test_pd[feature_columns]
+        y_test = test_pd["default"]
+
+        # Load the trained model
+        pipeline = joblib.load("loan_model.joblib")
+
+        # Make predictions
+        y_pred = pipeline.predict(X_test)
+
+        # Evaluate
+        accuracy = accuracy_score(y_test, y_pred)
+        report = classification_report(y_test, y_pred)
+
+        print(f"Accuracy: {accuracy:.2f}")
+        print("Classification Report:\n", report)
+    except MemoryError as e:
+        print("MemoryError: Out of memory during toPandas() or prediction.")
+    finally:
+        duration = time.time() - start_time
+        print(f"Total duration for prediction (without UDF): {duration:.2f} seconds")
+        gc.collect()  # Force garbage collection to free memory
+
+    spark.stop()
+
+
+if __name__=="__main__":
+    model_prediction()
