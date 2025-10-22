@@ -1,0 +1,114 @@
+from pyspark.sql.functions import (
+    rand, randn, when, col, expr, monotonically_increasing_id,
+    round as spark_round, floor, lit
+)
+from pyspark.sql.types import *
+import random
+
+
+
+
+
+def generate_bank_data(spark, num_records=10_000_000, output_path="./bank_data"):
+    """
+    Generate large synthetic bank loan dataset using PySpark
+
+    Args:
+        spark: SparkSession
+        num_records: Number of records to generate (default: 10 million)
+        output_path: Path to save parquet files
+    """
+    print(f"Generating {num_records:,} synthetic bank loan records...")
+
+    # Generate base data using Spark's random functions
+    df = spark.range(0, num_records) \
+        .withColumn("customer_id", monotonically_increasing_id()) \
+        .withColumn("age", (rand() * 45 + 21).cast("int"))       \
+        .withColumn("annual_income", (randn() * 25000 + 75000).cast("double")) \
+        .withColumn("credit_score", (randn() * 80 + 700).cast("int")) \
+        .withColumn("employment_length", (rand() * 30).cast("int")) \
+        .withColumn("loan_amount", (randn() * 35000 + 50000).cast("double")) \
+        .withColumn("interest_rate", (rand() * 15 + 5).cast("double")) \
+        .withColumn("loan_term",
+                    when(rand() < 0.7, 36).otherwise(60)) \
+        .withColumn("home_ownership",
+                    when(rand() < 0.45, "MORTGAGE")
+                    .when(rand() < 0.75, "RENT")
+                    .otherwise("OWN")) \
+        .withColumn("loan_purpose",
+                    when(rand() < 0.30, "debt_consolidation")
+                    .when(rand() < 0.55, "credit_card")
+                    .when(rand() < 0.75, "home_improvement")
+                    .when(rand() < 0.85, "major_purchase")
+                    .when(rand() < 0.92, "car")
+                    .otherwise("other")) \
+        .withColumn("monthly_debt", (rand() * 3000 + 500).cast("double")) \
+        .withColumn("credit_card_balance", (rand() * 15000).cast("double")) \
+        .withColumn("credit_limit", (rand() * 20000 + 5000).cast("double")) \
+        .withColumn("num_credit_inquiries", (rand() * 8).cast("int")) \
+        .withColumn("delinquencies_2yrs",
+                    when(rand() < 0.85, 0)
+                    .when(rand() < 0.95, 1)
+                    .otherwise(2)) \
+        .withColumn("num_open_accounts", (rand() * 20 + 3).cast("int")) \
+        .withColumn("bankruptcies", when(rand() < 0.95, 0).otherwise(1))
+
+    # Apply realistic constraints
+    df = df.withColumn("annual_income",
+                       when(col("annual_income") < 25000, 25000)
+                       .when(col("annual_income") > 200000, 200000)
+                       .otherwise(col("annual_income"))) \
+        .withColumn("credit_score",
+                    when(col("credit_score") < 550, 550)
+                    .when(col("credit_score") > 850, 850)
+                    .otherwise(col("credit_score"))) \
+        .withColumn("loan_amount",
+                    when(col("loan_amount") < 5000, 5000)
+                    .when(col("loan_amount") > 150000, 150000)
+                    .otherwise(col("loan_amount")))
+
+    # Calculate derived features
+    df = df.withColumn("debt_to_income", col("monthly_debt") / (col("annual_income") / 12)) \
+        .withColumn("loan_to_income", col("loan_amount") / col("annual_income")) \
+        .withColumn("credit_utilization", col("credit_card_balance") / col("credit_limit"))
+
+    # Create target variable (default_flag) based on risk factors
+    df = df.withColumn("risk_score",
+                       (lit(1.0) - (col("credit_score") - 550) / 300) * 0.4 +
+                       (col("debt_to_income") / 2) * 0.3 +
+                       (col("loan_to_income")) * 0.2 +
+                       (col("delinquencies_2yrs") / 3) * 0.1 +
+                       (rand() * 0.3))  # Add some randomness
+
+    # Assign default flag based on risk score
+    df = df.withColumn("default_flag",
+                       when(col("risk_score") > 0.65, 1).otherwise(0).cast("int"))
+
+    # Drop intermediate columns
+    df = df.drop("risk_score")
+
+    # Round numeric columns
+    numeric_cols = ["annual_income", "loan_amount", "interest_rate",
+                    "monthly_debt", "credit_card_balance", "credit_limit",
+                    "debt_to_income", "loan_to_income", "credit_utilization"]
+
+    for col_name in numeric_cols:
+        df = df.withColumn(col_name, spark_round(col(col_name), 2))
+
+    # Show statistics
+    print("\nDataset Statistics:")
+    df.select("age", "annual_income", "credit_score", "loan_amount").describe().show()
+
+    print("\nDefault Rate:")
+    df.groupBy("default_flag").count().withColumn(
+        "percentage", (col("count") / num_records * 100)
+    ).show()
+
+    # Save to parquet with partitioning for efficient reading
+    print(f"\nSaving data to {output_path}...")
+    df.coalesce(20).write.mode("overwrite").parquet(output_path)
+
+    print(f"✓ Successfully generated and saved {num_records:,} records")
+    print(f"✓ Data saved to: {output_path}")
+
+    return df
