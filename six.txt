@@ -1,0 +1,57 @@
+import pandas as pd
+from sklearn.metrics import accuracy_score, classification_report
+import joblib
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col
+import time
+import gc
+
+# Initialize Spark Session
+spark = SparkSession.builder.appName("BankLoanDefaultPredictionWithoutUDF").getOrCreate()
+
+# Print number of partitions (data may be distributed, but toPandas() collects to driver)
+print(f"Number of partitions in test data: {spark.read.parquet('loans_test.parquet').rdd.getNumPartitions()}")
+
+# Read loans test data and customers data from Parquet
+loans_test_df = spark.read.parquet("loans_test.parquet")
+customers_df = spark.read.parquet("customers.parquet")
+
+# Data Preparation: Join loans with customers on customer_id
+joined_df = loans_test_df.join(customers_df, on="customer_id", how="inner")
+
+# Add a new derived feature (credit_income_ratio)
+joined_df = joined_df.withColumn("credit_income_ratio", col("credit_score") / col("income"))
+
+# Measure time for prediction
+start_time = time.time()
+
+try:
+    # Convert to Pandas for scikit-learn prediction (collects to driver; may cause OOM)
+    test_pd = joined_df.toPandas()
+
+    # Separate features and target
+    feature_columns = ["age", "income", "loan_amount", "credit_score", "years_employed", "num_dependents", "credit_income_ratio"]
+    X_test = test_pd[feature_columns]
+    y_test = test_pd["default"]
+
+    # Load the trained model
+    pipeline = joblib.load("loan_default_model.pkl")
+
+    # Make predictions
+    y_pred = pipeline.predict(X_test)
+
+    # Evaluate
+    accuracy = accuracy_score(y_test, y_pred)
+    report = classification_report(y_test, y_pred)
+
+    print(f"Accuracy: {accuracy:.2f}")
+    print("Classification Report:\n", report)
+except MemoryError:
+    print("MemoryError: Out of memory during toPandas() or prediction.")
+finally:
+    duration = time.time() - start_time
+    print(f"Total duration for prediction (without UDF): {duration:.2f} seconds")
+    gc.collect()  # Force garbage collection to free memory
+
+# Stop Spark Session
+spark.stop()
