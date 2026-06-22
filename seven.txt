@@ -1,97 +1,34 @@
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import pandas_udf
-from pyspark.sql.types import DoubleType, StructType, StructField
-import pandas as pd
-import joblib
-from pyspark.ml.evaluation import BinaryClassificationEvaluator, MulticlassClassificationEvaluator
-from pyspark.sql.functions import col, spark_partition_id
-import time
+#!/usr/bin/env python
+"""
+Training script for churn prediction model
+"""
+
+import sys
 import os
-from typing import Iterator
 
-# Initialize Spark Session
-spark = SparkSession.builder.appName("BankLoanDefaultPredictionWithUDF").getOrCreate()
+# Add parent directory to path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Load the trained scikit-learn model and broadcast it
-model = joblib.load("loan_default_model.pkl")
-broadcast_model = spark.sparkContext.broadcast(model)
+from orange.config import Config
+from orange.training_pipeline import TrainingPipeline
 
-# Define pandas_udf with type hints for GROUPED_MAP
-feature_columns = ["age", "income", "loan_amount", "credit_score", "years_employed", "num_dependents", "credit_income_ratio"]
+def main():
+    """Run training pipeline"""
+    
+    # Load configuration
+    config = Config()
+    
+    # Run training
+    pipeline = TrainingPipeline(config)
+    metrics = pipeline.run()
+    
+    print("\n📊 Final Training Metrics:")
+    print(f"   - Accuracy: {metrics['accuracy']:.3f}")
+    print(f"   - AUC-ROC: {metrics['auc']:.3f}")
+    print(f"   - Features: {metrics['n_features']}")
+    print(f"   - Samples: {metrics['n_samples']}")
+    
+    return metrics
 
-def predict_udf(pdf_iterator: Iterator[pd.DataFrame]) -> Iterator[pd.DataFrame]:
-    clf = broadcast_model.value
-    for pdf in pdf_iterator:
-        preds = clf.predict(pdf[feature_columns]).astype(float)
-        pids = [os.getpid()] * len(pdf)
-        yield pd.DataFrame({'prediction': preds, 'pid': pids})
-
-# Define schema for the UDF output
-schema = StructType([
-    StructField("prediction", DoubleType(), False),
-    StructField("pid", DoubleType(), False)  # Process ID to verify distribution
-])
-
-# Register the UDF with type hints
-predict_udf = pandas_udf(predict_udf, returnType=schema)
-
-# Read loans test data and customers data from Parquet
-loans_test_df = spark.read.parquet("loans_test.parquet")
-customers_df = spark.read.parquet("customers.parquet")
-
-# Data Preparation: Join loans with customers on customer_id
-joined_df = loans_test_df.join(customers_df, on="customer_id", how="inner")
-
-# Add a new derived feature (credit_income_ratio)
-joined_df = joined_df.withColumn("credit_income_ratio", col("credit_score") / col("income"))
-
-# Measure time for prediction
-start_time = time.time()
-
-# Apply predictions using pandas_udf (distributed)
-predictions = joined_df.groupBy(spark_partition_id()).apply(predict_udf)
-
-# Verify distribution: Collect unique pids
-unique_pids = predictions.select("pid").distinct().collect()
-print(f"Unique process IDs (if >1, distributed): {[row.pid for row in unique_pids]}")
-
-# Show sample predictions
-predictions.select("prediction", "pid").show(5)
-
-# Evaluate the model
-evaluator_accuracy = MulticlassClassificationEvaluator(
-    labelCol="default", predictionCol="prediction", metricName="accuracy"
-)
-accuracy = evaluator_accuracy.evaluate(predictions)
-
-evaluator_auc = BinaryClassificationEvaluator(
-    labelCol="default", predictionCol="prediction", metricName="areaUnderROC"
-)
-auc = evaluator_auc.evaluate(predictions)
-
-evaluator_f1 = MulticlassClassificationEvaluator(
-    labelCol="default", predictionCol="prediction", metricName="f1"
-)
-f1 = evaluator_f1.evaluate(predictions)
-
-evaluator_precision = MulticlassClassificationEvaluator(
-    labelCol="default", predictionCol="prediction", metricName="weightedPrecision"
-)
-precision = evaluator_precision.evaluate(predictions)
-
-evaluator_recall = MulticlassClassificationEvaluator(
-    labelCol="default", predictionCol="prediction", metricName="weightedRecall"
-)
-recall = evaluator_recall.evaluate(predictions)
-
-print(f"Accuracy: {accuracy:.2f}")
-print(f"AUC: {auc:.2f}")
-print(f"F1 Score: {f1:.2f}")
-print(f"Precision: {precision:.2f}")
-print(f"Recall: {recall:.2f}")
-
-duration = time.time() - start_time
-print(f"Total duration for prediction (with UDF): {duration:.2f} seconds")
-
-# Stop Spark Session
-spark.stop()
+if __name__ == "__main__":
+    main()
