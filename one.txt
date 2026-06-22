@@ -1,52 +1,21 @@
-# data_generation.py
+import os
+from dataclasses import dataclass
 
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import rand, when, col
-from pyspark.sql.types import IntegerType, DoubleType
-
-# Initialize Spark Session
-spark = SparkSession.builder.appName("BankLoanDefaultDataGeneration").getOrCreate()
-
-# Generate Huge Synthetic Data (1,000,000 rows)
-num_rows = 1000000
-
-# Generate customers data (additional source)
-customers = spark.range(num_rows).select(
-    col("id").alias("customer_id"),
-    (rand() * 30).cast(IntegerType()).alias("years_employed"),
-    (rand() * 5).cast(IntegerType()).alias("num_dependents")
-)
-
-# Save customers as Parquet (partitioned for huge data)
-customers.write.parquet("customers.parquet", mode="overwrite")
-
-# Generate loans data (main source with customer_id for join)
-loans = spark.range(num_rows).select(
-    col("id").alias("customer_id"),
-    (rand() * 52 + 18).cast(IntegerType()).alias("age"),
-    (rand() * 180000 + 20000).cast(DoubleType()).alias("income"),
-    (rand() * 45000 + 5000).cast(DoubleType()).alias("loan_amount"),
-    (rand() * 550 + 300).cast(IntegerType()).alias("credit_score")
-)
-
-# Simulate default target (based on loans features)
-loans = loans.withColumn("loan_income_ratio", col("loan_amount") / col("income"))
-loans = loans.withColumn("default", when(
-    (col("credit_score") < 600) | (col("loan_income_ratio") > 0.5),
-    when(rand() > 0.3, 1).otherwise(0)
-).otherwise(
-    when(rand() > 0.9, 1).otherwise(0)
-).cast(IntegerType()))
-
-# Drop temporary column
-loans = loans.drop("loan_income_ratio")
-
-# Split loans into train and test (70/30)
-loans_train, loans_test = loans.randomSplit([0.7, 0.3], seed=42)
-
-# Save as Parquet files (partitioned for scalability)
-loans_train.write.parquet("loans_train.parquet", mode="overwrite")
-loans_test.write.parquet("loans_test.parquet", mode="overwrite")
-
-# Stop Spark Session
-spark.stop()
+@dataclass
+class Config:
+    """Configuration for the churn prediction system"""
+    
+    # GCP Settings
+    project_id: str = os.getenv('GCP_PROJECT_ID', 'your-project-id')
+    location: str = os.getenv('GCP_LOCATION', 'us-central1')
+    gcs_bucket: str = os.getenv('GCS_BUCKET', 'churn-feature-store-demo')
+    
+    # Feature Store Settings
+    featurestore_id: str = os.getenv('FEATURESTORE_ID', 'churn_featurestore')
+    entity_type_id: str = os.getenv('ENTITY_TYPE_ID', 'customer')
+    
+    # Data Settings
+    num_customers: int = int(os.getenv('NUM_CUSTOMERS', '5000'))
+    
+    # Model Settings
+    model_path: str = os.getenv('MODEL_PATH', 'models/churn_model.pkl')
