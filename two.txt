@@ -1,14 +1,52 @@
-You are machine learning engineer and using latest aiplatform libruary where there is seprate package called for vertexai. Give me completed code Keeping in this in mind can you give me full implementation 
- for churn classification usecase with data of transaction, customer and any other needed.
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+from typing import Tuple
 
- 1> Generate own data which will be avalable at run time,
- 2> Keep all code in package called orange. 
- 3> Keep flow simple as I am focusing feature store implenetation using GCP vertexAI and deploy via azure pipeline
- 4> give me training and prediction pipeline both 
- 5> you can use pyspark for data processing and pandas for model trainig and prediction.
- 6> i am using custom container for model training and dataproc cluster for data procesinsg and prediction
-
-can you check as features store are in below package. Can you modify the code again and shared me the latest code
-from vertexai.resources.preview import feature_store
-from vertexai.resources.preview.feature_store import utils as fs_utils
-my main goal is to implemet feature store so can you entire code more simple for all other process and aligned more on how to implement feature store
+class DataGenerator:
+    """Generate synthetic customer and transaction data"""
+    
+    def __init__(self, num_customers: int = 5000):
+        self.num_customers = num_customers
+        np.random.seed(42)
+    
+    def generate(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Generate customer and transaction data"""
+        
+        # Generate customer data
+        customers = pd.DataFrame({
+            'customer_id': range(1, self.num_customers + 1),
+            'age': np.random.randint(18, 70, self.num_customers),
+            'gender': np.random.choice(['M', 'F'], self.num_customers),
+            'tenure_months': np.random.randint(1, 60, self.num_customers),
+            'monthly_income': np.random.normal(5000, 2000, self.num_customers).clip(1000, 20000),
+            'credit_score': np.random.normal(650, 100, self.num_customers).clip(300, 850),
+            'num_products': np.random.choice([1, 2, 3, 4], self.num_customers, p=[0.3, 0.4, 0.2, 0.1]),
+            'has_credit_card': np.random.choice([0, 1], self.num_customers, p=[0.3, 0.7]),
+            'is_active_member': np.random.choice([0, 1], self.num_customers, p=[0.2, 0.8]),
+            'geography': np.random.choice(['US', 'UK', 'Canada', 'Germany'], self.num_customers),
+            'registration_date': [
+                datetime.now() - timedelta(days=np.random.randint(30, 1825))
+                for _ in range(self.num_customers)
+            ]
+        })
+        
+        # Generate transaction data
+        transactions = []
+        for _, customer in customers.iterrows():
+            num_tx = np.random.poisson(lam=5) + 1
+            for _ in range(num_tx):
+                tx_date = datetime.now() - timedelta(days=np.random.randint(1, 90))
+                amount = customer['monthly_income'] * np.random.uniform(0.01, 0.2)
+                transactions.append({
+                    'customer_id': customer['customer_id'],
+                    'transaction_date': tx_date,
+                    'amount': amount,
+                    'category': np.random.choice(['retail', 'entertainment', 'utilities', 'travel']),
+                    'is_online': np.random.choice([0, 1], p=[0.3, 0.7])
+                })
+        
+        transactions_df = pd.DataFrame(transactions)
+        
+        print(f"✅ Generated {len(customers)} customers and {len(transactions_df)} transactions")
+        return customers, transactions_df
