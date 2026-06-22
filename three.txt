@@ -1,72 +1,220 @@
-# prediction.py
-
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import pandas_udf, PandasUDFType
-from pyspark.sql.types import DoubleType
+from vertexai import init
+from vertexai.resources.preview import feature_store
+from vertexai.resources.preview.feature_store import utils as fs_utils
 import pandas as pd
-import joblib
-from pyspark.ml.evaluation import BinaryClassificationEvaluator, MulticlassClassificationEvaluator
-from pyspark.sql.functions import col
+from datetime import datetime
+from typing import List, Dict
+import logging
 
-# Initialize Spark Session
-spark = SparkSession.builder.appName("BankLoanDefaultPrediction").getOrCreate()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Load the trained scikit-learn model and broadcast it
-model = joblib.load("loan_default_model.pkl")
-broadcast_model = spark.sparkContext.broadcast(model)
-
-# Define pandas_udf for distributed predictions
-feature_columns = ["age", "income", "loan_amount", "credit_score", "years_employed", "num_dependents", "credit_income_ratio"]
-
-@pandas_udf(DoubleType(), PandasUDFType.SCALAR)
-def predict_udf(*cols) -> pd.Series:
-    # Reconstruct DataFrame from columns
-    df = pd.DataFrame({feature: col for feature, col in zip(feature_columns, cols)})
-    # Access the broadcasted model
-    clf = broadcast_model.value
-    # Predict using the scikit-learn pipeline
-    return pd.Series(clf.predict(df).astype(float))
-
-# Read loans test data and customers data from Parquet
-loans_test_df = spark.read.parquet("loans_test.parquet")
-customers_df = spark.read.parquet("customers.parquet")
-
-# Data Preparation: Join loans with customers on customer_id
-joined_df = loans_test_df.join(customers_df, on="customer_id", how="inner")
-
-# Add a new derived feature (credit_income_ratio)
-joined_df = joined_df.withColumn("credit_income_ratio", col("credit_score") / col("income"))
-
-# Make predictions using pandas_udf (distributed)
-predictions = joined_df.withColumn("prediction", predict_udf(*feature_columns))
-
-# Select relevant columns for viewing
-predictions.select("default", "prediction", "customer_id").show(5)
-
-# Evaluate the model
-# Accuracy
-evaluator_accuracy = MulticlassClassificationEvaluator(labelCol="default", predictionCol="prediction", metricName="accuracy")
-accuracy = evaluator_accuracy.evaluate(predictions)
-
-# AUC for binary classification
-evaluator_auc = BinaryClassificationEvaluator(labelCol="default", rawPredictionCol="prediction", metricName="areaUnderROC")
-auc = evaluator_auc.evaluate(predictions)
-
-# Precision, Recall, F1 (weighted)
-evaluator_f1 = MulticlassClassificationEvaluator(labelCol="default", predictionCol="prediction", metricName="f1")
-f1 = evaluator_f1.evaluate(predictions)
-
-evaluator_precision = MulticlassClassificationEvaluator(labelCol="default", predictionCol="prediction", metricName="weightedPrecision")
-precision = evaluator_precision.evaluate(predictions)
-
-evaluator_recall = MulticlassClassificationEvaluator(labelCol="default", predictionCol="prediction", metricName="weightedRecall")
-recall = evaluator_recall.evaluate(predictions)
-
-print(f"Accuracy: {accuracy:.2f}")
-print(f"AUC: {auc:.2f}")
-print(f"F1 Score: {f1:.2f}")
-print(f"Precision: {precision:.2f}")
-print(f"Recall: {recall:.2f}")
-
-# Stop Spark Session
-spark.stop()
+class FeatureStoreManager:
+    """
+    Complete Feature Store Manager for Churn Prediction
+    
+    This class handles all Feature Store operations including:
+    - Creating Feature Store and Entity Types
+    - Creating Features
+    - Ingesting data
+    - Reading features for training and prediction
+    """
+    
+    def __init__(self, project_id: str, location: str, featurestore_id: str):
+        self.project_id = project_id
+        self.location = location
+        self.featurestore_id = featurestore_id
+        
+        # Initialize Vertex AI
+        init(project=project_id, location=location)
+        
+        # Initialize Feature Store components
+        self.featurestore = None
+        self.entity_type = None
+        
+        logger.info(f"✅ Feature Store Manager initialized for {project_id}")
+    
+    def create_featurestore(self) -> None:
+        """Step 1: Create or get existing Feature Store"""
+        try:
+            # Try to get existing featurestore
+            self.featurestore = feature_store.Featurestore(
+                name=self.featurestore_id,
+                project=self.project_id,
+                location=self.location
+            )
+            logger.info(f"✅ Using existing Feature Store: {self.featurestore_id}")
+        except Exception:
+            # Create new featurestore
+            logger.info(f"🔄 Creating new Feature Store: {self.featurestore_id}")
+            self.featurestore = feature_store.Featurestore.create(
+                featurestore_id=self.featurestore_id,
+                project=self.project_id,
+                location=self.location,
+                online_serving_config={
+                    "fixed_node_count": 1  # Enable online serving
+                }
+            )
+            logger.info(f"✅ Feature Store created: {self.featurestore_id}")
+    
+    def create_entity_type(self, entity_type_id: str) -> None:
+        """Step 2: Create Entity Type (like a table for your entities)"""
+        self.create_featurestore()
+        
+        try:
+            # Try to get existing entity type
+            self.entity_type = self.featurestore.get_entity_type(entity_type_id)
+            logger.info(f"✅ Using existing Entity Type: {entity_type_id}")
+        except Exception:
+            # Create new entity type
+            logger.info(f"🔄 Creating Entity Type: {entity_type_id}")
+            self.entity_type = feature_store.EntityType.create(
+                featurestore_name=self.featurestore.resource_name,
+                entity_type_id=entity_type_id,
+                description="Customer entity for churn prediction"
+            )
+            logger.info(f"✅ Entity Type created: {entity_type_id}")
+    
+    def create_features(self, feature_definitions: Dict[str, str]) -> None:
+        """
+        Step 3: Create Features
+        
+        feature_definitions: Dictionary of {feature_name: value_type}
+        Value types: STRING, INT64, DOUBLE, BOOL, TIMESTAMP
+        """
+        if self.entity_type is None:
+            raise ValueError("Entity Type not created. Call create_entity_type() first.")
+        
+        logger.info(f"🔄 Creating {len(feature_definitions)} features...")
+        
+        for feature_name, value_type in feature_definitions.items():
+            try:
+                # Check if feature exists
+                feature = self.entity_type.get_feature(feature_name)
+                logger.info(f"  ✅ Feature already exists: {feature_name}")
+            except Exception:
+                # Create new feature
+                feature = feature_store.Feature.create(
+                    entity_type_name=self.entity_type.resource_name,
+                    feature_id=feature_name,
+                    value_type=value_type,
+                    description=f"Feature: {feature_name}"
+                )
+                logger.info(f"  ✅ Feature created: {feature_name} ({value_type})")
+        
+        logger.info("✅ All features created successfully")
+    
+    def ingest_data(self, data: pd.DataFrame, 
+                   entity_id_column: str = 'customer_id') -> None:
+        """
+        Step 4: Ingest data into Feature Store
+        
+        This is the most important step - uploading your feature data
+        """
+        if self.entity_type is None:
+            raise ValueError("Entity Type not created. Call create_entity_type() first.")
+        
+        # Add timestamp if not present (required for Feature Store)
+        if 'feature_timestamp' not in data.columns:
+            data['feature_timestamp'] = datetime.now()
+        
+        # Prepare data for ingestion
+        # Feature Store expects: entity_id, features, and timestamp
+        required_cols = list(data.columns)
+        
+        logger.info(f"🔄 Ingesting {len(data)} records into Feature Store...")
+        
+        try:
+            # Use batch_ingest_from_dataframe for efficient ingestion
+            self.entity_type.batch_ingest_from_dataframe(
+                dataframe=data,
+                feature_ids=[col for col in data.columns if col != entity_id_column],
+                entity_id_column=entity_id_column
+            )
+            logger.info(f"✅ Successfully ingested {len(data)} records")
+        except Exception as e:
+            logger.error(f"❌ Failed to ingest data: {str(e)}")
+            raise
+    
+    def read_features(self, entity_ids: List[str]) -> pd.DataFrame:
+        """
+        Step 5: Read features from Feature Store
+        
+        This is used for both training and prediction
+        """
+        if self.entity_type is None:
+            raise ValueError("Entity Type not created. Call create_entity_type() first.")
+        
+        # Get all feature IDs
+        all_features = self.entity_type.list_features()
+        feature_ids = [f.name for f in all_features]
+        
+        logger.info(f"🔄 Reading features for {len(entity_ids)} entities...")
+        
+        try:
+            # Read features using batch read
+            response = self.entity_type.batch_read_feature_values(
+                entity_ids=[str(eid) for eid in entity_ids],
+                feature_ids=feature_ids
+            )
+            
+            # Convert to DataFrame
+            if response:
+                df = pd.DataFrame(response)
+                logger.info(f"✅ Read {len(df)} records with {len(df.columns)} features")
+                return df
+            else:
+                logger.warning("No features found")
+                return pd.DataFrame()
+                
+        except Exception as e:
+            logger.error(f"❌ Failed to read features: {str(e)}")
+            raise
+    
+    def get_feature_definitions(self) -> Dict[str, str]:
+        """Define all features for churn prediction"""
+        return {
+            # Customer demographic features
+            'age': 'INT64',
+            'gender': 'STRING',
+            'geography': 'STRING',
+            
+            # Account features
+            'tenure_months': 'INT64',
+            'monthly_income': 'DOUBLE',
+            'credit_score': 'INT64',
+            'num_products': 'INT64',
+            'has_credit_card': 'BOOL',
+            'is_active_member': 'BOOL',
+            
+            # Transaction features
+            'avg_transaction_amount': 'DOUBLE',
+            'transaction_count': 'INT64',
+            'days_since_last_transaction': 'INT64',
+            'online_transaction_ratio': 'DOUBLE',
+            'total_transaction_amount': 'DOUBLE',
+            'transaction_frequency': 'DOUBLE'
+        }
+    
+    def get_feature_columns(self) -> List[str]:
+        """Get list of all feature names"""
+        return list(self.get_feature_definitions().keys())
+    
+    def setup_complete_feature_store(self):
+        """Complete setup: Feature Store + Entity Type + Features"""
+        logger.info("=" * 60)
+        logger.info("🚀 Setting up Complete Feature Store")
+        logger.info("=" * 60)
+        
+        # Step 1: Create Feature Store
+        self.create_featurestore()
+        
+        # Step 2: Create Entity Type
+        self.create_entity_type('customer')
+        
+        # Step 3: Create Features
+        self.create_features(self.get_feature_definitions())
+        
+        logger.info("=" * 60)
+        logger.info("✅ Feature Store Setup Complete")
+        logger.info("=" * 60)
