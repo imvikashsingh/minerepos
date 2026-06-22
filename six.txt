@@ -1,57 +1,129 @@
 import pandas as pd
-from sklearn.metrics import accuracy_score, classification_report
-import joblib
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col
-import time
-import gc
+import pickle
+import logging
 
-# Initialize Spark Session
-spark = SparkSession.builder.appName("BankLoanDefaultPredictionWithoutUDF").getOrCreate()
+from orange.config import Config
+from orange.data_generator import DataGenerator
+from orange.feature_store_manager import FeatureStoreManager
+from orange.feature_engineering import FeatureEngineer
 
-# Print number of partitions (data may be distributed, but toPandas() collects to driver)
-print(f"Number of partitions in test data: {spark.read.parquet('loans_test.parquet').rdd.getNumPartitions()}")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Read loans test data and customers data from Parquet
-loans_test_df = spark.read.parquet("loans_test.parquet")
-customers_df = spark.read.parquet("customers.parquet")
-
-# Data Preparation: Join loans with customers on customer_id
-joined_df = loans_test_df.join(customers_df, on="customer_id", how="inner")
-
-# Add a new derived feature (credit_income_ratio)
-joined_df = joined_df.withColumn("credit_income_ratio", col("credit_score") / col("income"))
-
-# Measure time for prediction
-start_time = time.time()
-
-try:
-    # Convert to Pandas for scikit-learn prediction (collects to driver; may cause OOM)
-    test_pd = joined_df.toPandas()
-
-    # Separate features and target
-    feature_columns = ["age", "income", "loan_amount", "credit_score", "years_employed", "num_dependents", "credit_income_ratio"]
-    X_test = test_pd[feature_columns]
-    y_test = test_pd["default"]
-
-    # Load the trained model
-    pipeline = joblib.load("loan_default_model.pkl")
-
-    # Make predictions
-    y_pred = pipeline.predict(X_test)
-
-    # Evaluate
-    accuracy = accuracy_score(y_test, y_pred)
-    report = classification_report(y_test, y_pred)
-
-    print(f"Accuracy: {accuracy:.2f}")
-    print("Classification Report:\n", report)
-except MemoryError:
-    print("MemoryError: Out of memory during toPandas() or prediction.")
-finally:
-    duration = time.time() - start_time
-    print(f"Total duration for prediction (without UDF): {duration:.2f} seconds")
-    gc.collect()  # Force garbage collection to free memory
-
-# Stop Spark Session
-spark.stop()
+class PredictionPipeline:
+    """
+    Prediction Pipeline with Feature Store Integration
+    
+    Flow:
+    1. Generate new data (or get from source)
+    2. Engineer features
+    3. Ingest features into Feature Store
+    4. Read features from Feature Store
+    5. Make predictions
+    """
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.feature_store = FeatureStoreManager(
+            project_id=config.project_id,
+            location=config.location,
+            featurestore_id=config.featurestore_id
+        )
+        self.model = None
+        self.label_encoders = {}
+        self.scaler = None
+    
+    def load_model(self):
+        """Load trained model"""
+        with open(self.config.model_path, 'rb') as f:
+            artifacts = pickle.load(f)
+        
+        self.model = artifacts['model']
+        self.label_encoders = artifacts['label_encoders']
+        self.scaler = artifacts['scaler']
+        
+        print("✅ Model loaded successfully")
+    
+    def run(self):
+        """Execute the prediction pipeline"""
+        
+        print("\n" + "=" * 60)
+        print("🔮 CHURN MODEL PREDICTION PIPELINE")
+        print("=" * 60)
+        
+        # Step 1: Load Model
+        print("\n📂 Step 1: Loading Model...")
+        self.load_model()
+        
+        # Step 2: Generate New Data
+        print("\n📊 Step 2: Generating New Customer Data...")
+        customers, transactions = DataGenerator(
+            num_customers=100  # Predict for 100 new customers
+        ).generate()
+        
+        # Step 3: Engineer Features
+        print("\n🔧 Step 3: Engineering Features...")
+        features = FeatureEngineer.engineer_features(customers, transactions)
+        
+        # Step 4: Ingest Features into Feature Store
+        print("\n📤 Step 4: Ingesting Features into Feature Store...")
+        feature_columns = self.feature_store.get_feature_columns()
+        ingest_data = features[feature_columns + ['customer_id']].copy()
+        
+        self.feature_store.ingest_data(
+            data=ingest_data,
+            entity_id_column='customer_id'
+        )
+        
+        # Step 5: Read Features from Feature Store
+        print("\n📥 Step 5: Reading Features from Feature Store...")
+        customer_ids = features['customer_id'].tolist()
+        store_features = self.feature_store.read_features(customer_ids)
+        
+        # Step 6: Make Predictions
+        print("\n🔮 Step 6: Making Predictions...")
+        
+        # Prepare features
+        feature_cols = [col for col in store_features.columns if col != 'customer_id']
+        X = store_features[feature_cols].copy()
+        
+        # Encode categorical features (use stored encoders)
+        for col in ['gender', 'geography']:
+            if col in X.columns and col in self.label_encoders:
+                X[col] = self.label_encoders[col].transform(X[col].fillna('unknown'))
+        
+        # Scale numeric features
+        numeric_cols = X.select_dtypes(include=['float64', 'int64']).columns
+        X[numeric_cols] = self.scaler.transform(X[numeric_cols])
+        
+        # Predict
+        predictions = self.model.predict(X)
+        probabilities = self.model.predict_proba(X)[:, 1]
+        
+        # Create results
+        results = pd.DataFrame({
+            'customer_id': store_features['customer_id'],
+            'churn_prediction': predictions,
+            'churn_probability': probabilities,
+            'risk_level': pd.cut(
+                probabilities,
+                bins=[0, 0.3, 0.6, 1],
+                labels=['Low', 'Medium', 'High']
+            )
+        })
+        
+        # Step 7: Show Results
+        print("\n📊 Step 7: Prediction Results:")
+        print(f"   - Total customers: {len(results)}")
+        print(f"   - High risk: {(results['risk_level'] == 'High').sum()}")
+        print(f"   - Medium risk: {(results['risk_level'] == 'Medium').sum()}")
+        print(f"   - Low risk: {(results['risk_level'] == 'Low').sum()}")
+        
+        print("\n📋 Sample Predictions:")
+        print(results.head(10).to_string(index=False))
+        
+        print("\n" + "=" * 60)
+        print("✅ PREDICTION PIPELINE COMPLETE")
+        print("=" * 60)
+        
+        return results
