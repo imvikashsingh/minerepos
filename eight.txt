@@ -1,0 +1,33 @@
+#!/usr/bin/env python
+"""
+Prediction script for churn prediction model
+"""
+
+import sys
+import os
+
+# Add parent directory to path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from orange.config import Config
+from orange.prediction_pipeline import PredictionPipeline
+
+def main():
+    """Run prediction pipeline"""
+    
+    # Load configuration
+    config = Config()
+    
+    # Run prediction
+    pipeline = PredictionPipeline(config)
+    results = pipeline.run()
+    
+    # Save results (optional)
+    output_path = "prediction_results.csv"
+    results.to_csv(output_path, index=False)
+    print(f"\n✅ Results saved to {output_path}")
+    
+    return results
+
+if __name__ == "__main__":
+    main()
